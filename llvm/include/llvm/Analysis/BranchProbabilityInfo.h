@@ -21,6 +21,8 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/ValueHandle.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/BranchProbability.h"
 #include "llvm/Support/Casting.h"
@@ -50,7 +52,7 @@ class Value;
 /// As an example, we can have a switch which jumps to Dst with value 0 and
 /// value 10.
 class BranchProbabilityInfo {
-public:
+ public:
   BranchProbabilityInfo() = default;
 
   BranchProbabilityInfo(const Function &F, const LoopInfo &LI,
@@ -59,14 +61,17 @@ public:
   }
 
   BranchProbabilityInfo(BranchProbabilityInfo &&Arg)
-      : Probs(std::move(Arg.Probs)), LastF(Arg.LastF),
-        PostDominatedByUnreachable(std::move(Arg.PostDominatedByUnreachable)),
-        PostDominatedByColdCall(std::move(Arg.PostDominatedByColdCall)) {}
+      :
+      Probs(std::move(Arg.Probs)),
+      LastF(Arg.LastF),
+      PostDominatedByUnreachable(std::move(Arg.PostDominatedByUnreachable)),
+      PostDominatedByColdCall(std::move(Arg.PostDominatedByColdCall)) {
+  }
 
-  BranchProbabilityInfo(const BranchProbabilityInfo &) = delete;
-  BranchProbabilityInfo &operator=(const BranchProbabilityInfo &) = delete;
+  BranchProbabilityInfo(const BranchProbabilityInfo&) = delete;
+  BranchProbabilityInfo& operator=(const BranchProbabilityInfo&) = delete;
 
-  BranchProbabilityInfo &operator=(BranchProbabilityInfo &&RHS) {
+  BranchProbabilityInfo& operator=(BranchProbabilityInfo &&RHS) {
     releaseMemory();
     Probs = std::move(RHS.Probs);
     PostDominatedByColdCall = std::move(RHS.PostDominatedByColdCall);
@@ -106,14 +111,14 @@ public:
   ///
   /// Given a basic block, look through its successors and if one exists for
   /// which \see isEdgeHot would return true, return that successor block.
-  const BasicBlock *getHotSucc(const BasicBlock *BB) const;
+  const BasicBlock* getHotSucc(const BasicBlock *BB) const;
 
   /// Print an edge's probability.
   ///
   /// Retrieves an edge's probability similarly to \see getEdgeProbability, but
   /// then prints that probability to the provided stream. That stream is then
   /// returned.
-  raw_ostream &printEdgeProbability(raw_ostream &OS, const BasicBlock *Src,
+  raw_ostream& printEdgeProbability(raw_ostream &OS, const BasicBlock *Src,
                                     const BasicBlock *Dst) const;
 
   /// Set the raw edge probability for the given edge.
@@ -131,7 +136,9 @@ public:
   }
 
   void calculate(const Function &F, const LoopInfo &LI,
-                 const TargetLibraryInfo *TLI = nullptr);
+                 const TargetLibraryInfo *TLI = nullptr, ScalarEvolution *SE =
+                     nullptr,
+                 AAResults *AA = nullptr);
 
   /// Forget analysis results for the given basic block.
   void eraseBlock(const BasicBlock *BB);
@@ -145,7 +152,7 @@ public:
     SccHeaderMaps SccHeaders;
   };
 
-private:
+ private:
   // We need to store CallbackVH's in order to correctly handle basic block
   // removal.
   class BasicBlockCallbackVH final : public CallbackVH {
@@ -157,9 +164,12 @@ private:
       BPI->Handles.erase(*this);
     }
 
-  public:
+   public:
     BasicBlockCallbackVH(const Value *V, BranchProbabilityInfo *BPI = nullptr)
-        : CallbackVH(const_cast<Value *>(V)), BPI(BPI) {}
+        :
+        CallbackVH(const_cast<Value*>(V)),
+        BPI(BPI) {
+    }
   };
 
   DenseSet<BasicBlockCallbackVH, DenseMapInfo<Value*>> Handles;
@@ -182,32 +192,33 @@ private:
   const Function *LastF;
 
   /// Track the set of blocks directly succeeded by a returning block.
-  SmallPtrSet<const BasicBlock *, 16> PostDominatedByUnreachable;
+  SmallPtrSet<const BasicBlock*, 16> PostDominatedByUnreachable;
 
   /// Track the set of blocks that always lead to a cold call.
-  SmallPtrSet<const BasicBlock *, 16> PostDominatedByColdCall;
+  SmallPtrSet<const BasicBlock*, 16> PostDominatedByColdCall;
 
   void updatePostDominatedByUnreachable(const BasicBlock *BB);
   void updatePostDominatedByColdCall(const BasicBlock *BB);
   bool calcUnreachableHeuristics(const BasicBlock *BB);
   bool calcMetadataWeights(const BasicBlock *BB);
+  bool calcEquality(const BasicBlock *BB);
   bool calcColdCallHeuristics(const BasicBlock *BB);
-  bool calcPointerHeuristics(const BasicBlock *BB);
+  bool calcPointerHeuristics(const BasicBlock *BB, AAResults *AA = nullptr);
   bool calcLoopBranchHeuristics(const BasicBlock *BB, const LoopInfo &LI,
-                                SccInfo &SccI);
+                                SccInfo &SccI, ScalarEvolution *SE = nullptr);
   bool calcZeroHeuristics(const BasicBlock *BB, const TargetLibraryInfo *TLI);
   bool calcFloatingPointHeuristics(const BasicBlock *BB);
   bool calcInvokeHeuristics(const BasicBlock *BB);
 };
 
 /// Analysis pass which computes \c BranchProbabilityInfo.
-class BranchProbabilityAnalysis
-    : public AnalysisInfoMixin<BranchProbabilityAnalysis> {
-  friend AnalysisInfoMixin<BranchProbabilityAnalysis>;
+class BranchProbabilityAnalysis : public AnalysisInfoMixin<
+    BranchProbabilityAnalysis> {
+  friend AnalysisInfoMixin<BranchProbabilityAnalysis> ;
 
   static AnalysisKey Key;
 
-public:
+ public:
   /// Provide the result type for this analysis pass.
   using Result = BranchProbabilityInfo;
 
@@ -216,12 +227,15 @@ public:
 };
 
 /// Printer pass for the \c BranchProbabilityAnalysis results.
-class BranchProbabilityPrinterPass
-    : public PassInfoMixin<BranchProbabilityPrinterPass> {
+class BranchProbabilityPrinterPass : public PassInfoMixin<
+    BranchProbabilityPrinterPass> {
   raw_ostream &OS;
 
-public:
-  explicit BranchProbabilityPrinterPass(raw_ostream &OS) : OS(OS) {}
+ public:
+  explicit BranchProbabilityPrinterPass(raw_ostream &OS)
+      :
+      OS(OS) {
+  }
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
@@ -230,16 +244,22 @@ public:
 class BranchProbabilityInfoWrapperPass : public FunctionPass {
   BranchProbabilityInfo BPI;
 
-public:
+ public:
   static char ID;
 
-  BranchProbabilityInfoWrapperPass() : FunctionPass(ID) {
+  BranchProbabilityInfoWrapperPass()
+      :
+      FunctionPass(ID) {
     initializeBranchProbabilityInfoWrapperPassPass(
         *PassRegistry::getPassRegistry());
   }
 
-  BranchProbabilityInfo &getBPI() { return BPI; }
-  const BranchProbabilityInfo &getBPI() const { return BPI; }
+  BranchProbabilityInfo& getBPI() {
+    return BPI;
+  }
+  const BranchProbabilityInfo& getBPI() const {
+    return BPI;
+  }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override;
   bool runOnFunction(Function &F) override;
@@ -247,6 +267,6 @@ public:
   void print(raw_ostream &OS, const Module *M = nullptr) const override;
 };
 
-} // end namespace llvm
+}  // end namespace llvm
 
 #endif // LLVM_ANALYSIS_BRANCHPROBABILITYINFO_H
